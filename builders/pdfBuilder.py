@@ -1,13 +1,17 @@
 # ST2/ST3 compat
-from __future__ import print_function 
+from __future__ import print_function
+
+import latextools_plugin
+
+import os
 import sublime
+import sys
+
 if sublime.version() < '3000':
     # we are on ST2 and Python 2.X
 	_ST3 = False
 else:
 	_ST3 = True
-
-import os.path
 
 DEBUG = False
 
@@ -19,7 +23,7 @@ DEBUG = False
 # NOTE: this will have to be moved eventually.
 #
 
-class PdfBuilder(object):
+class PdfBuilder(latextools_plugin.LaTeXToolsPlugin):
 	"""Base class for build engines"""
 
 	# Configure parameters here
@@ -34,9 +38,9 @@ class PdfBuilder(object):
 	# Your __init__ method *must* call this (via super) to ensure that
 	# tex_root is properly split into the root tex file's directory,
 	# its base name, and extension, etc.
-
-	def __init__(self, tex_root, output, engine, options,
-				 tex_directives, builder_settings, platform_settings):
+	def __init__(self, tex_root, output, engine, options, aux_directory,
+				 output_directory, job_name, tex_directives,
+				 builder_settings, platform_settings):
 		self.tex_root = tex_root
 		self.tex_dir, self.tex_name = os.path.split(tex_root)
 		self.base_name, self.tex_ext = os.path.splitext(self.tex_name)
@@ -44,6 +48,9 @@ class PdfBuilder(object):
 		self.out = ""
 		self.engine = engine
 		self.options = options
+		self.output_directory = output_directory
+		self.aux_directory = aux_directory
+		self.job_name = job_name
 		self.tex_directives = tex_directives
 		self.builder_settings = builder_settings
 		self.platform_settings = platform_settings
@@ -69,7 +76,7 @@ class PdfBuilder(object):
 	# If no command must be run, just yield ("","")
 	# Remember that we are now in the root file's directory
 	def commands(self):
-		pass
+		raise NotImplementedError()
 
 	# Clean up after ourselves
 	# Only the build system knows what to delete for sure, so give this option
@@ -78,4 +85,9 @@ class PdfBuilder(object):
 	# NOTE: problem. Either we make the builder class persistent, or we have to
 	# pass the tex root again. Need to think about this
 	def cleantemps(self):
-		return False
+		return NotImplementedError()
+
+# ensure pdfBuilder is available to any custom builders
+latextools_plugin.add_whitelist_module('pdfBuilder',
+	sys.modules[PdfBuilder.__module__]
+)

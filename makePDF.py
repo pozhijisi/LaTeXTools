@@ -1,38 +1,51 @@
 # ST2/ST3 compat
-from __future__ import print_function 
+from __future__ import print_function
+
 import sublime
 if sublime.version() < '3000':
-    # we are on ST2 and Python 2.X
+	# we are on ST2 and Python 2.X
 	_ST3 = False
 	import getTeXRoot
 	import parseTeXlog
-	strbase = basestring
+	from latextools_plugin import (
+		add_plugin_path, get_plugin, NoSuchPluginException,
+		_classname_to_internal_name
+	)
 	from latextools_utils.is_tex_file import is_tex_file
-	from latextools_utils import get_setting, parse_tex_directives
+	from latextools_utils import get_setting
+	from latextools_utils.tex_directives import parse_tex_directives
+	from latextools_utils.output_directory import (
+		get_aux_directory, get_output_directory, get_jobname
+	)
 
 	strbase = basestring
 else:
 	_ST3 = True
 	from . import getTeXRoot
 	from . import parseTeXlog
-	strbase = str
+	from .latextools_plugin import (
+		add_plugin_path, get_plugin, NoSuchPluginException,
+		_classname_to_internal_name
+	)
 	from .latextools_utils.is_tex_file import is_tex_file
-	from .latextools_utils import get_setting, parse_tex_directives
+	from .latextools_utils import get_setting
+	from .latextools_utils.tex_directives import parse_tex_directives
+	from .latextools_utils.output_directory import (
+		get_aux_directory, get_output_directory, get_jobname
+	)
 
 	strbase = str
 
 import sublime_plugin
 import sys
-import imp
 import os, os.path
 import signal
 import threading
 import functools
 import subprocess
 import types
-import re
-import codecs
 import traceback
+import shutil
 
 DEBUG = False
 
@@ -187,22 +200,65 @@ class CmdThread ( threading.Thread ):
 		# Clean up
 		cmd_iterator.close()
 
-		# CHANGED 12-10-27. OK, here's the deal. We must open in binary mode on Windows
-		# because silly MiKTeX inserts ASCII control characters in over/underfull warnings.
-		# In particular it inserts EOFs, which stop reading altogether; reading in binary
-		# prevents that. However, that's not the whole story: if a FS character is encountered,
-		# AND if we invoke splitlines on a STRING, it sadly breaks the line in two. This messes up
-		# line numbers in error reports. If, on the other hand, we invoke splitlines on a
-		# byte array (? whatever read() returns), this does not happen---we only break at \n, etc.
-		# However, we must still decode the resulting lines using the relevant encoding.
-		# 121101 -- moved splitting and decoding logic to parseTeXlog, where it belongs.
-		
-		# Note to self: need to think whether we don't want to codecs.open this, too...
-		# Also, we may want to move part of this logic to the builder...
 		try:
-			data = open(self.caller.tex_base + ".log", 'rb').read()		
+			# Here we try to find the log file...
+			# 1. Check the aux_directory if there is one
+			# 2. Check the output_directory if there is one
+			# 3. Assume the log file is in the same folder as the main file
+			log_file_base = self.caller.tex_base + ".log"
+			if self.caller.aux_directory is None:
+				if self.caller.output_directory is None:
+					log_file = log_file_base
+				else:
+					log_file = os.path.join(
+						self.caller.output_directory,
+						log_file_base
+					)
+			else:
+				log_file = os.path.join(
+					self.caller.aux_directory,
+					log_file_base
+				)
+
+				if not os.path.exists(log_file):
+					if (self.caller.output_directory is not None and
+						self.caller.output_directory != self.caller.aux_directory
+					):
+						log_file = os.path.join(
+							self.caller.output_directory,
+							log_file_base
+						)
+
+					if not os.path.exists(log_file):
+						log_file = log_file_base
+
+			# CHANGED 12-10-27. OK, here's the deal. We must open in binary mode
+			# on Windows because silly MiKTeX inserts ASCII control characters in
+			# over/underfull warnings. In particular it inserts EOFs, which
+			# stop reading altogether; reading in binary prevents that. However,
+			# that's not the whole story: if a FS character is encountered,
+			# AND if we invoke splitlines on a STRING, it sadly breaks the line
+			# in two. This messes up line numbers in error reports. If, on the
+			# other hand, we invoke splitlines on a byte array (? whatever read()
+			# returns), this does not happen---we only break at \n, etc.
+			# However, we must still decode the resulting lines using the relevant
+			# encoding.
+
+			# Note to self: need to think whether we don't want to codecs.open
+			# this, too... Also, we may want to move part of this logic to the
+			# builder...
+			with open(log_file, 'rb') as f:
+				data = f.read()
 		except IOError:
-			self.handle_std_outputs(out, err)
+			self.caller.output([
+				"", ""
+				"Could not find log file {0}!".format(log_file_base),
+			])
+			try:
+				self.handle_std_outputs(out, err)
+			except:
+				# if out or err don't yet exist
+				self.caller.finish(False)
 		else:
 			errors = []
 			warnings = []
@@ -277,13 +333,23 @@ class CmdThread ( threading.Thread ):
 					else:
 						sublime.set_timeout(lambda: sublime.status_message(message), 10)
 			except Exception as e:
-				content=["",""]
-				content.append("LaTeXtools could not parse the TeX log file")
+				# dumpt exception to console
+				traceback.print_exc()
+
+				content = ["", ""]
+				content.append(
+					"LaTeXTools could not parse the TeX log file {0}".format(
+						log_file
+					)
+				)
 				content.append("(actually, we never should have gotten here)")
 				content.append("")
-				content.append("Python exception: " + repr(e))
+				content.append("Python exception: {0!r}".format(e))
 				content.append("")
-				content.append("Please let me know on GitHub. Thanks!")
+				content.append(
+					"The full error description can be found on the console."
+				)
+				content.append("Please let us know on GitHub. Thanks!")
 
 			self.caller.output(content)
 			self.caller.output("\n\n[Done!]\n")
@@ -344,7 +410,7 @@ class make_pdfCommand(sublime_plugin.WindowCommand):
 			sublime.error_message(self.file_name + ": file not found.")
 			return
 
-		self.tex_base, self.tex_ext = os.path.splitext(self.file_name)
+		self.tex_base = get_jobname(view)
 		tex_dir = os.path.dirname(self.file_name)
 
 		if not is_tex_file(self.file_name):
@@ -386,14 +452,17 @@ class make_pdfCommand(sublime_plugin.WindowCommand):
 		# This *must* exist, so if it doesn't, the user didn't migrate
 		if builder_name is None:
 			sublime.error_message("LaTeXTools: you need to migrate your preferences. See the README file for instructions.")
+			self.window.run_command('hide_panel', {"panel": "output.exec"})
 			return
+
 		# Default to 'traditional' builder
 		if builder_name in ['', 'default']:
 			builder_name = 'traditional'
-		# relative to ST packages dir!
-		builder_path = get_setting("builder_path", "")
-		builder_file_name   = builder_name + 'Builder.py'
-		builder_class_name  = builder_name.capitalize() + 'Builder'
+
+		# this is to convert old-style names (e.g. AReallyLongName)
+		# to new style plugin names (a_really_long_name)
+		builder_name = _classname_to_internal_name(builder_name)
+
 		builder_settings = get_setting("builder_settings", {})
 
 		# parse root for any %!TEX directives
@@ -422,6 +491,17 @@ class make_pdfCommand(sublime_plugin.WindowCommand):
 		if 'options' in tex_directives:
 			options.extend(tex_directives['options'])
 
+		# filter out --aux-directory and --output-directory options which are
+		# handled separately
+		options = [opt for opt in options if (
+			not opt.startswith('--aux-directory') and
+			not opt.startswith('--output-directory') and
+			not opt.startswith('--jobname')
+		)]
+
+		self.aux_directory = get_aux_directory(self.file_name)
+		self.output_directory = get_output_directory(self.file_name)
+
 		# Read the env option (platform specific)
 		builder_platform_settings = builder_settings.get(self.plat)
 		if builder_platform_settings:
@@ -429,60 +509,46 @@ class make_pdfCommand(sublime_plugin.WindowCommand):
 		else:
 			self.env = None
 
+		# Now actually get the builder
+		builder_path = get_setting("builder_path", "")  # relative to ST packages dir!
+
 		# Safety check: if we are using a built-in builder, disregard
 		# builder_path, even if it was specified in the pref file
-		if builder_name in ['simple', 'traditional', 'script', 'default','']:
+		if builder_name in ['simple', 'traditional', 'script', 'basic']:
 			builder_path = None
 
-		# Now actually get the builder
-		ltt_path = os.path.join(sublime.packages_path(),'LaTeXTools','builders')
 		if builder_path:
 			bld_path = os.path.join(sublime.packages_path(), builder_path)
-		else:
-			bld_path = ltt_path
-		bld_file = os.path.join(bld_path, builder_file_name)
+			add_plugin_path(bld_path)
 
-		if not os.path.isfile(bld_file):
+		try:
+			builder = get_plugin('{0}_builder'.format(builder_name))
+		except NoSuchPluginException:
 			sublime.error_message("Cannot find builder " + builder_name + ".\n" \
 							      "Check your LaTeXTools Preferences")
+			self.window.run_command('hide_panel', {"panel": "output.exec"})
 			return
-		
-		# We save the system path and TEMPORARILY add the builders path to it,
-		# so we can simply "import pdfBuilder" in the builder module
-		# For custom builders, we need to add both the LaTeXTools builders
-		# path, as well as the custom path specified above.
-		# The mechanics are from http://effbot.org/zone/import-string.htm
 
-		syspath_save = list(sys.path)
-		sys.path.insert(0, ltt_path)
-		if builder_path:
-			sys.path.insert(0, bld_path)
-		builder_module = __import__(builder_name + 'Builder')
-		sys.path[:] = syspath_save
-		
-		print(repr(builder_module))
-		builder_class = getattr(builder_module, builder_class_name)
-		print(repr(builder_class))
-		# We should now be able to construct the builder object
-		self.builder = builder_class(
+		print(repr(builder))
+		self.builder = builder(
 			self.file_name,
 			self.output,
 			engine,
 			options,
+			self.aux_directory,
+			self.output_directory,
+			self.tex_base,
 			tex_directives,
 			builder_settings,
 			platform_settings
 		)
-		
-		# Restore Python system path
-		sys.path[:] = syspath_save
-		
+
 		# Now get the tex binary path from prefs, change directory to
 		# that of the tex root file, and run!
 		self.path = platform_settings['texpath']
 		os.chdir(tex_dir)
 		CmdThread(self).start()
-		print (threading.active_count())
+		print(threading.active_count())
 
 
 	# Threading headaches :-)
@@ -539,15 +605,31 @@ class make_pdfCommand(sublime_plugin.WindowCommand):
 		sublime.set_timeout(functools.partial(self.do_finish, can_switch_to_pdf), 0)
 
 	def do_finish(self, can_switch_to_pdf):
-		# Move to TextCommand for compatibility with ST3
-		# edit = self.output_view.begin_edit()
-		# self.output_view.sel().clear()
-		# reg = sublime.Region(0)
-		# self.output_view.sel().add(reg)
-		# self.output_view.show(reg) # scroll to top
-		# self.output_view.end_edit(edit)
 		self.output_view.run_command("do_finish_edit")
+		# can_switch_to_pdf indicates a pdf should've been created
 		if can_switch_to_pdf:
+			# if using output_directory, follow the copy_output_on_build setting
+			# files are copied to the same directory as the main tex file
+			if self.output_directory is not None:
+				copy_on_build = get_setting('copy_output_on_build', True) or True
+				if copy_on_build is True:
+					shutil.copy2(
+						os.path.join(
+							self.output_directory,
+							self.tex_base + u'.pdf'
+						),
+						os.path.dirname(self.file_name)
+					)
+				elif isinstance(copy_on_build, list):
+					for ext in copy_on_build:
+						shutil.copy2(
+							os.path.join(
+								self.output_directory,
+								self.tex_base + ext
+							),
+							os.path.dirname(self.file_name)
+						)
+
 			self.view.run_command("jump_to_pdf", {"from_keybinding": False})
 
 
@@ -563,3 +645,20 @@ class DoFinishEditCommand(sublime_plugin.TextCommand):
         reg = sublime.Region(0)
         self.view.sel().add(reg)
         self.view.show(reg)
+
+def plugin_loaded():
+	# load the plugins from the builders dir
+	ltt_path = os.path.join(sublime.packages_path(), 'LaTeXTools', 'builders')
+	# ensure that pdfBuilder is loaded first as otherwise, the other builders
+	# will not be registered as plugins
+	add_plugin_path(os.path.join(ltt_path, 'pdfBuilder.py'))
+	add_plugin_path(ltt_path)
+
+	# load any .latextools_builder files from User directory
+	add_plugin_path(
+		os.path.join(sublime.packages_path(), 'User'),
+		'*.latextools_builder'
+	)
+
+if not _ST3:
+	plugin_loaded()
